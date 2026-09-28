@@ -1,6 +1,30 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
+export type SegmentReviewState = 'unreviewed' | 'pending' | 'reviewed';
+export type RevisionStatus = 'pending' | 'approved' | 'rejected' | 'conflict';
+export type ConflictChoice = 'incoming' | 'current';
+
+/** 一次“播出回修”记录：保存回修原因、上一版（送播中）内容与处理结果。 */
+export interface CaptionRevision {
+  id: string;
+  revisionNo: number;
+  createdAt: number;
+  reason: string;
+  previousSpeaker: string;
+  previousText: string;
+  nextSpeaker: string;
+  nextText: string;
+  status: RevisionStatus;
+  /** 离线期间提交，恢复合并后才参与冲突判定。 */
+  createdOffline: boolean;
+  /** 提交回修时该片段是否已经完成过复查（离线恢复时据此判断是否构成冲突）。 */
+  baseReviewed: boolean;
+  resolvedAt?: number;
+  /** 冲突时校对员的选择：采用晚到回修 / 保留已复查版本。 */
+  resolvedChoice?: ConflictChoice;
+  resolveNote?: string;
+}
 
 export interface CaptionSegment {
   id: string;
@@ -18,6 +42,10 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  reviewState: SegmentReviewState;
+  /** 新版本排在最前，历史版本始终保留以便回看。 */
+  reviewHistory: CaptionRevision[];
+  reviewedAt?: number;
 }
 
 export interface TermRule {
@@ -79,11 +107,33 @@ function segment(
     state,
     revision: 0,
     tags: [],
+    reviewState: state === 'confirmed' ? 'unreviewed' : 'unreviewed',
+    reviewHistory: [],
   };
 }
 
 const seededSegments: CaptionSegment[] = [
-  segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
+  {
+    ...segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发部会。', 'confirmed'),
+    reviewState: 'reviewed',
+    reviewedAt: now - 300_000,
+    reviewHistory: [
+      {
+        id: 'rev-seg-1-1',
+        revisionNo: 1,
+        createdAt: now - 420_000,
+        reason: '播出后观众反馈错字：“发部会”应为“发布会”',
+        previousSpeaker: '主持人',
+        previousText: '欢迎大家来到2026年产品发部会。',
+        nextSpeaker: '主持人',
+        nextText: '欢迎大家来到2026年产品发布会。',
+        status: 'approved',
+        createdOffline: false,
+        baseReviewed: false,
+        resolvedAt: now - 300_000,
+      },
+    ],
+  },
   segment('seg-2', 2, 7, '主讲人', '今天我们会介绍三个模块,首先是实时协作。', '今天我们会介绍三个模块，首先是实时协作。', 'confirmed'),
   segment('seg-3', 3, 15, '主讲人', '延迟和质量监测会帮助我们保持字幕稳定。', '延迟和质量监测会帮助我们保持字幕稳定。', 'confirmed'),
   segment('seg-4', 4, 24, '嘉宾 / 周然', '我们使用 studio cloud 作为演示环境。', '我们使用 Studio Cloud 作为演示环境。', 'pending'),
@@ -116,6 +166,18 @@ export function createInitialModel(): DeskModel {
     nextSequence: 9,
     autoStream: true,
     updatedAt: now,
+  };
+}
+
+/** 为旧版本草稿补齐播出回修字段，保证重新打开页面后历史数据仍可用。 */
+export function migrateModel(model: DeskModel): DeskModel {
+  return {
+    ...model,
+    segments: model.segments.map((item) => ({
+      ...item,
+      reviewState: item.reviewState ?? (item.state === 'confirmed' ? 'unreviewed' : 'unreviewed'),
+      reviewHistory: item.reviewHistory ?? [],
+    })),
   };
 }
 
@@ -191,15 +253,121 @@ export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[
   });
 }
 
+export function activeRevision(segment: CaptionSegment): CaptionRevision | undefined {
+  return segment.reviewHistory.find((item) => item.status === 'pending' || item.status === 'conflict');
+}
+
+/** 提交一次播出回修：保存上一版内容与原因，原字幕继续播出，状态转为待复核。 */
+export function submitSegmentRevision(
+  segments: CaptionSegment[],
+  segmentId: string,
+  draft: { reason: string; speaker: string; text: string },
+  offline: boolean,
+): CaptionSegment[] {
+  const reason = draft.reason.trim();
+  const text = draft.text.trim();
+  const time = Date.now();
+  return segments.map((item) => {
+    if (item.id !== segmentId || item.state !== 'confirmed') return item;
+    if (activeRevision(item)) return item; // 待复核/待裁决期间不能叠加新回修
+    const revisionNo = item.reviewHistory.length + 1;
+    const revision: CaptionRevision = {
+      id: `rev-${segmentId}-${time.toString(36)}`,
+      revisionNo,
+      createdAt: time,
+      reason,
+      previousSpeaker: item.speaker,
+      previousText: item.corrected,
+      nextSpeaker: draft.speaker,
+      nextText: text,
+      status: 'pending',
+      createdOffline: offline,
+      baseReviewed: item.reviewState === 'reviewed',
+    };
+    return {
+      ...item,
+      reviewHistory: [revision, ...item.reviewHistory],
+      reviewState: 'pending',
+    };
+  });
+}
+
+/** 复核完成：通过则用新版本替换送播内容，驳回则原内容继续播出。 */
+export function resolveSegmentRevision(
+  segments: CaptionSegment[],
+  revisionId: string,
+  decision: 'approved' | 'rejected',
+  note = '',
+): CaptionSegment[] {
+  const time = Date.now();
+  return segments.map((item) => {
+    const target = item.reviewHistory.find((rev) => rev.id === revisionId);
+    if (!target || (target.status !== 'pending' && target.status !== 'conflict')) return item;
+    const reviewed: CaptionRevision = {
+      ...target,
+      status: decision,
+      resolvedAt: time,
+      resolveNote: note || (decision === 'approved'
+        ? '复核通过，已更新直播内容'
+        : '复核驳回，直播内容保持不变'),
+      resolvedChoice: target.resolvedChoice ?? (decision === 'approved' ? 'incoming' : 'current'),
+    };
+    if (decision === 'rejected') {
+      return {
+        ...item,
+        reviewHistory: item.reviewHistory.map((rev) => rev.id === revisionId ? reviewed : rev),
+        reviewState: 'reviewed',
+        reviewedAt: time,
+      };
+    }
+    return {
+      ...item,
+      speaker: target.nextSpeaker,
+      corrected: target.nextText,
+      revision: item.revision + 1,
+      reviewHistory: item.reviewHistory.map((rev) => rev.id === revisionId ? reviewed : rev),
+      reviewState: 'reviewed',
+      reviewedAt: time,
+    };
+  });
+}
+
+/** 离线冲突裁决：校对员选择采用晚到回修，还是保留已复查的播出版本。 */
+export function resolveRevisionConflict(
+  segments: CaptionSegment[],
+  revisionId: string,
+  choice: ConflictChoice,
+): CaptionSegment[] {
+  return resolveSegmentRevision(
+    segments,
+    revisionId,
+    choice === 'incoming' ? 'approved' : 'rejected',
+    choice === 'incoming' ? '离线晚到版本与已复查版本不一致，校对员选择采用晚到回修' : '离线晚到版本与已复查版本不一致，校对员选择保留已复查版本',
+  ).map((item) => {
+    const target = item.reviewHistory.find((rev) => rev.id === revisionId);
+    if (!target) return item;
+    return { ...item, reviewHistory: item.reviewHistory.map((rev) => rev.id === revisionId ? { ...rev, resolvedChoice: choice } : rev) };
+  });
+}
+
+/** 已确认且没有待处理回修时，校对员可直接标记“已复查、无需修改”。 */
+export function markSegmentReviewed(segments: CaptionSegment[], segmentId: string): CaptionSegment[] {
+  return segments.map((item) => {
+    if (item.id !== segmentId || item.state !== 'confirmed' || activeRevision(item)) return item;
+    return { ...item, reviewState: 'reviewed', reviewedAt: Date.now() };
+  });
+}
+
 export function mergeConfirmedSegments(model: DeskModel): DeskModel {
   const seen: string[] = [];
-  const segments = model.segments
+  const time = Date.now();
+  let segments = model.segments
     .map((item) => ({ ...item }))
     .sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime)
     .map((item): CaptionSegment => {
       if (item.source === 'offline' && item.state === 'confirmed') {
-        item.source = item.confirmedAt && Date.now() - item.confirmedAt > 90_000 ? 'offline' : 'live';
-        item.staleReason = Date.now() - item.receivedAt > 90_000 ? `离线恢复后合并，原始片段已延迟 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` : undefined;
+        item.source = item.confirmedAt && time - item.confirmedAt > 90_000 ? 'offline' : 'live';
+        item.staleReason = time - item.receivedAt > 90_000 ? `离线恢复后合并，原始片段已延迟 ${Math.round((time - item.receivedAt) / 1000)} 秒` : undefined;
         if (item.staleReason) item.state = 'stale';
       }
       const duplicate = isDuplicate(item, seen.map((id) => model.segments.find((segmentItem) => segmentItem.id === id)).filter(Boolean) as CaptionSegment[]);
@@ -211,14 +379,94 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
       return item;
     });
 
+  // 离线期间提交的播出回修在恢复后落地：
+  // 若同一片段已被复查且晚到版本与播出版本不一致，不能直接覆盖，转为冲突并排展示。
+  segments = segments.map((item) => {
+    const pendingOffline = item.reviewHistory.find((rev) => rev.status === 'pending' && rev.createdOffline);
+    if (!pendingOffline) return item;
+    const sameAsLive = pendingOffline.nextText.trim() === item.corrected.trim() && pendingOffline.nextSpeaker === item.speaker;
+    if (pendingOffline.baseReviewed && !sameAsLive) {
+      const conflict: CaptionRevision = { ...pendingOffline, status: 'conflict' };
+      return {
+        ...item,
+        reviewState: 'pending',
+        reviewHistory: item.reviewHistory.map((rev) => rev.id === conflict.id ? conflict : rev),
+      };
+    }
+    const autoApproved: CaptionRevision = {
+      ...pendingOffline,
+      status: 'approved',
+      resolvedAt: time,
+      resolvedChoice: 'incoming',
+      resolveNote: sameAsLive ? '离线回修内容与当前播出版本一致，自动确认' : '恢复时该段尚未复查，离线回修自动通过',
+    };
+    const base = sameAsLive ? item : { ...item, speaker: pendingOffline.nextSpeaker, corrected: pendingOffline.nextText, revision: item.revision + 1 };
+    return {
+      ...base,
+      reviewState: 'reviewed',
+      reviewedAt: time,
+      reviewHistory: item.reviewHistory.map((rev) => rev.id === autoApproved.id ? autoApproved : rev),
+    };
+  });
+
   return {
     ...model,
     segments,
     connection: 'connected',
     simulatedDelay: Math.max(0.8, model.simulatedDelay - 0.7),
-    lastMergedAt: Date.now(),
-    updatedAt: Date.now(),
+    lastMergedAt: time,
+    updatedAt: time,
   };
+}
+
+export interface DiffPart {
+  type: 'same' | 'add' | 'remove';
+  value: string;
+}
+
+/** 逐字 LCS 差异，供并排对比晚到版本与已复查版本。 */
+export function diffText(current: string, incoming: string): DiffPart[] {
+  const a = [...current];
+  const b = [...incoming];
+  const table: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      table[i][j] = a[i] === b[j]
+        ? table[i + 1][j + 1] + 1
+        : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  const raw: DiffPart[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      raw.push({ type: 'same', value: a[i] });
+      i += 1;
+      j += 1;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      raw.push({ type: 'remove', value: a[i] });
+      i += 1;
+    } else {
+      raw.push({ type: 'add', value: b[j] });
+      j += 1;
+    }
+  }
+  while (i < a.length) {
+    raw.push({ type: 'remove', value: a[i] });
+    i += 1;
+  }
+  while (j < b.length) {
+    raw.push({ type: 'add', value: b[j] });
+    j += 1;
+  }
+  // 合并连续的同类片段，减少 DOM 节点。
+  return raw.reduce<DiffPart[]>((acc, part) => {
+    const last = acc[acc.length - 1];
+    if (last && last.type === part.type) last.value += part.value;
+    else acc.push({ ...part });
+    return acc;
+  }, []);
 }
 
 export function queueStats(model: DeskModel) {
@@ -226,11 +474,14 @@ export function queueStats(model: DeskModel) {
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  const reviewPending = model.segments.filter((item) => item.state === 'confirmed' && item.reviewState === 'pending');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
     offline: offline.length,
+    reviewPending: reviewPending.length,
+    revisionConflict: reviewPending.filter((item) => activeRevision(item)?.status === 'conflict').length,
     backlog: pending.length + stale.length + duplicate.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
@@ -260,6 +511,8 @@ export function createLiveSegment(sequence: number): CaptionSegment {
     state: 'pending',
     revision: 0,
     tags: [],
+    reviewState: 'unreviewed',
+    reviewHistory: [],
   };
 }
 

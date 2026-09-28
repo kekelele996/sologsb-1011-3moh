@@ -1,18 +1,28 @@
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
+  activeRevision,
   applyRules,
   cloneModel,
   createInitialModel,
+  diffText,
+  markSegmentReviewed,
   mergeConfirmedSegments,
+  migrateModel,
   normalizeNumbers,
   queueStats,
+  resolveRevisionConflict,
+  resolveSegmentRevision,
   STORAGE_KEY,
   simulateLatency,
+  submitSegmentRevision,
   toSrt,
+  type CaptionRevision,
   type CaptionSegment,
+  type ConflictChoice,
   type ConnectionState,
   type DeskModel,
+  type SegmentReviewState,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -43,6 +53,18 @@ function stateLabel(state: SegmentState): string {
 
 function connectionLabel(state: ConnectionState): string {
   return { connected: '连接稳定', degraded: '延迟波动', offline: '离线校正' }[state];
+}
+
+function reviewStateLabel(review: SegmentReviewState): string {
+  return { unreviewed: '未复查', pending: '待复核', reviewed: '已复查' }[review];
+}
+
+function revisionStatusLabel(status: CaptionRevision['status']): string {
+  return { pending: '待复核', approved: '复核通过', rejected: '复核驳回', conflict: '版本冲突待裁决' }[status];
+}
+
+function formatStamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 @customElement('caption-desk')
@@ -122,7 +144,7 @@ export class CaptionDesk extends LitElement {
     .header-actions cds-button { --cds-button-primary: #0f62fe; }
 
     .status-strip {
-      min-height: 60px; padding: 8px 20px; display: grid; grid-template-columns: 1.5fr repeat(4, minmax(118px, .6fr)) auto;
+      min-height: 60px; padding: 8px 20px; display: grid; grid-template-columns: 1.4fr repeat(5, minmax(96px, .55fr)) auto;
       gap: 0; align-items: stretch; background: var(--cds-layer, #fff); border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0);
     }
     .status-cell { padding: 7px 16px; border-right: 1px solid var(--cds-border-subtle, #e0e0e0); display: flex; flex-direction: column; justify-content: center; }
@@ -162,6 +184,8 @@ export class CaptionDesk extends LitElement {
     .segment-card.duplicate { border-left-color: #a56eff; }
     .segment-card.stale { border-left-color: #f1c21b; background: color-mix(in srgb, #fff 92%, #f1c21b 8%); }
     .segment-card.confirmed { border-left-color: #42be65; }
+    .segment-card.review-pending { border-left-color: #f1c21b; background: color-mix(in srgb, #fff 92%, #f1c21b 8%); }
+    .segment-card.review-conflict { border-left-color: #fa4d56; background: color-mix(in srgb, #fff 92%, #fa4d56 8%); }
     .segment-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
     .segment-meta > span:first-child { color: var(--cds-text-secondary, #525252); font: 500 10px/1 "IBM Plex Mono", monospace; }
     .segment-state { font-size: 10px; color: #525252; }
@@ -212,18 +236,82 @@ export class CaptionDesk extends LitElement {
     .rule-form cds-text-input, .rule-form cds-button { width: 100%; }
     .rule-form .full { grid-column: 1 / -1; }
     .live-timeline { padding: 6px 0; }
-    .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
+    .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+
+    .revision-banner { margin: 0 10px 9px; padding: 9px 11px; border-left: 3px solid #0f62fe; background: #edf5ff; color: #0043ce; font-size: 10px; line-height: 1.5; }
+    .revision-banner.review-pending { border-color: #f1c21b; background: #fff8e1; color: #684e00; }
+    .revision-banner.review-conflict { border-color: #fa4d56; background: #fff1f1; color: #a2191f; }
+    .revision-banner.review-done { border-color: #42be65; background: #defbe6; color: #198038; }
+    .revision-banner strong { display: block; font-size: 11px; margin-bottom: 3px; }
+
+    .revision-scroll { padding: 14px; overflow: auto; }
+    .revision-card { background: var(--cds-layer, #fff); border: 1px solid var(--cds-border-subtle, #e0e0e0); margin-bottom: 12px; }
+    .revision-card-head { padding: 12px 14px 10px; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .revision-card-body { padding: 13px 14px; display: flex; flex-direction: column; gap: 12px; }
+    .review-badges { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+
+    .review-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; font-size: 10px; border: 1px solid transparent; white-space: nowrap; }
+    .review-badge.unreviewed { background: #f4f4f4; border-color: #c6c6c6; color: #525252; }
+    .review-badge.pending { background: #fff8e1; border-color: #f1c21b; color: #684e00; }
+    .review-badge.conflict { background: #fff1f1; border-color: #fa4d56; color: #a2191f; }
+    .review-badge.reviewed { background: #defbe6; border-color: #42be65; color: #198038; }
+
+    .live-box { border-left: 3px solid #42be65; background: #f4f4f4; padding: 10px 12px; }
+    .live-box.live-pending { border-color: #f1c21b; background: #fff8e1; }
+    .live-box h4 { margin: 0 0 6px; font-size: 10px; color: #525252; letter-spacing: .04em; }
+    .live-box p { margin: 0; font-size: calc(var(--caption-font-size) * .96); line-height: 1.55; }
+    .live-box footer { margin-top: 7px; font-size: 10px; color: var(--cds-text-secondary, #525252); }
+
+    .propose-box { border-left: 3px solid #0f62fe; background: #edf5ff; padding: 10px 12px; }
+    .propose-box h4 { margin: 0 0 6px; font-size: 10px; color: #0043ce; letter-spacing: .04em; }
+    .propose-box p { margin: 0; font-size: calc(var(--caption-font-size) * .96); line-height: 1.55; }
+    .propose-box footer { margin-top: 7px; font-size: 10px; color: #0043ce; line-height: 1.5; }
+    .propose-box.offline { border-color: #8d8d8d; background: #f4f4f4; }
+
+    .conflict-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--cds-border-subtle, #e0e0e0); border: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .conflict-cell { background: var(--cds-layer, #fff); padding: 10px 11px; min-width: 0; }
+    .conflict-cell h4 { margin: 0 0 4px; font-size: 10px; letter-spacing: .03em; }
+    .conflict-cell.current h4 { color: #198038; }
+    .conflict-cell.incoming h4 { color: #a2191f; }
+    .conflict-cell p { margin: 0 0 8px; font-size: calc(var(--caption-font-size) * .86); line-height: 1.55; }
+    .conflict-cell small { display: block; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; margin-bottom: 8px; }
+    .diff-line { font-size: calc(var(--caption-font-size) * .9); line-height: 1.7; padding: 6px 8px; background: #f4f4f4; white-space: pre-wrap; word-break: break-all; }
+    .diff-add { background: #defbe6; color: #198038; }
+    .diff-remove { background: #fff1f1; color: #a2191f; text-decoration: line-through; }
+
+    .revision-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; padding-top: 2px; }
+    .revision-form-grid { display: grid; grid-template-columns: minmax(130px, .5fr) 1fr; gap: 12px; align-items: end; }
+    .revision-history { display: flex; flex-direction: column; gap: 8px; }
+    .history-item { border: 1px solid var(--cds-border-subtle, #e0e0e0); background: var(--cds-layer, #fff); }
+    .history-head { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 11px; cursor: pointer; font-size: 11px; }
+    .history-head:hover { background: var(--cds-layer-hover, #e8e8e8); }
+    .history-head time { color: var(--cds-text-secondary, #525252); font: 500 10px/1.4 "IBM Plex Mono", monospace; }
+    .history-body { padding: 0 11px 11px; display: flex; flex-direction: column; gap: 7px; }
+    .history-body .old, .history-body .next { padding: 7px 9px; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-all; }
+    .history-body .old { background: #fff1f1; border-left: 2px solid #fa4d56; color: #750e13; }
+    .history-body .next { background: #defbe6; border-left: 2px solid #42be65; color: #0b5d2a; }
+    .history-body .reason { font-size: 10px; color: var(--cds-text-secondary, #525252); line-height: 1.5; }
+    .history-body .resolve { font-size: 10px; color: #0043ce; line-height: 1.5; }
+
+    button.live-item { width: calc(100% - 20px); display: block; font: inherit; text-align: left; color: inherit; border: 0; cursor: pointer; }
+    .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); cursor: pointer; }
+    .live-item:hover { outline: 1px solid #78a9ff; }
+    .live-item.selected { outline: 2px solid #0f62fe; }
+    .live-item.review-pending { border-left-color: #f1c21b; }
+    .live-item.review-conflict { border-left-color: #fa4d56; }
+    .live-item.review-done { border-left-color: #42be65; }
     .live-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
-    .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .live-item-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .live-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
     @media (max-width: 1280px) {
       .workspace { grid-template-columns: minmax(340px, .85fr) minmax(410px, 1fr) minmax(330px, .85fr); }
-      .status-strip { grid-template-columns: 1.4fr repeat(4, minmax(100px, .55fr)); }
+      .status-strip { grid-template-columns: 1.3fr repeat(5, minmax(82px, .5fr)) auto; }
       .font-controls { display: none; }
     }
 
@@ -233,7 +321,7 @@ export class CaptionDesk extends LitElement {
       .workspace { grid-template-columns: 1fr; overflow: visible; }
       .column { min-height: 520px; }
       .shell { display: block; }
-      .status-strip { grid-template-columns: repeat(4, 1fr); }
+      .status-strip { grid-template-columns: repeat(3, 1fr); }
       .status-cell.hero { grid-column: 1 / -1; }
     }
   `;
@@ -246,6 +334,11 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private revisionText = this.model.segments.find((item) => item.id === this.model.selectedId)?.corrected ?? '';
+  @state() private revisionSpeaker = this.model.segments.find((item) => item.id === this.model.selectedId)?.speaker ?? '';
+  @state() private revisionReason = '';
+  @state() private expandedRevisionId = '';
+  @state() private revisionDraftId = this.model.selectedId;
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -268,11 +361,26 @@ export class CaptionDesk extends LitElement {
     super.disconnectedCallback();
   }
 
+  protected willUpdate(_changed: Map<string, unknown>): void {
+    if (_changed.has('model') && this.revisionDraftId !== this.model.selectedId) {
+      this.resetRevisionDraft();
+    }
+  }
+
+  private resetRevisionDraft(): void {
+    const item = this.selected;
+    this.revisionDraftId = this.model.selectedId;
+    this.revisionText = item?.corrected ?? '';
+    this.revisionSpeaker = item?.speaker ?? '';
+    this.revisionReason = '';
+    this.expandedRevisionId = '';
+  }
+
   private loadModel(): DeskModel {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
+        const parsed = migrateModel(JSON.parse(raw) as DeskModel);
         if (parsed.segments?.length) return parsed;
       }
     } catch {
@@ -340,6 +448,13 @@ export class CaptionDesk extends LitElement {
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
+  }
+
+  private reviewCardClass(item: CaptionSegment): string {
+    const revision = activeRevision(item);
+    if (revision?.status === 'conflict') return 'review-conflict';
+    if (item.reviewState === 'pending') return 'review-pending';
+    return item.reviewState === 'reviewed' ? 'review-done' : '';
   }
 
   private updateSelected(patch: Partial<CaptionSegment>, label = ''): void {
@@ -477,6 +592,90 @@ export class CaptionDesk extends LitElement {
     }));
   }
 
+  private submitRevision(): void {
+    const selected = this.selected;
+    if (!selected || selected.state !== 'confirmed') return;
+    const text = this.revisionText.trim();
+    const reason = this.revisionReason.trim();
+    if (!reason) {
+      this.pushToast('warning', '请填写回修原因', '播出回修必须记录原因，便于复核与回看');
+      return;
+    }
+    if (!text) {
+      this.pushToast('warning', '回修内容不能为空', '请填写修正后的字幕文本');
+      return;
+    }
+    if (text === selected.corrected && this.revisionSpeaker === selected.speaker) {
+      this.pushToast('info', '内容与当前播出版本一致', '若仅需确认无误，可直接标记为“已复查”');
+      return;
+    }
+    if (activeRevision(selected)) {
+      this.pushToast('warning', '该段已有待复核回修', '请等复核完成后再提交新的回修');
+      return;
+    }
+    const offline = this.model.connection === 'offline';
+    this.commit('播出回修已提交', (current) => ({
+      ...current,
+      segments: submitSegmentRevision(current.segments, selected.id, { reason, speaker: this.revisionSpeaker, text }, offline),
+    }));
+    this.resetRevisionDraft();
+    this.pushToast('warning', offline ? '回修暂存离线发件箱' : '该段进入待复核', offline
+      ? '原字幕继续播出，恢复连接后将检查是否与已复查版本冲突'
+      : '复核完成前原字幕继续播出，直播区可看到“待复核”标记');
+  }
+
+  private approveRevision(revisionId: string): void {
+    const exists = this.model.segments.some((item) => item.reviewHistory.some((rev) => rev.id === revisionId));
+    if (!exists) return;
+    this.commit('复核通过，直播内容已更新', (current) => ({
+      ...current,
+      segments: resolveSegmentRevision(current.segments, revisionId, 'approved'),
+    }));
+  }
+
+  private rejectRevision(revisionId: string): void {
+    const exists = this.model.segments.some((item) => item.reviewHistory.some((rev) => rev.id === revisionId));
+    if (!exists) return;
+    this.commit('复核驳回，原字幕继续播出', (current) => ({
+      ...current,
+      segments: resolveSegmentRevision(current.segments, revisionId, 'rejected'),
+    }));
+  }
+
+  private chooseConflictVersion(revisionId: string, choice: ConflictChoice): void {
+    const exists = this.model.segments.some((item) => item.reviewHistory.some((rev) => rev.id === revisionId));
+    if (!exists) return;
+    this.commit(choice === 'incoming' ? '已采用晚到回修版本' : '已保留已复查版本', (current) => ({
+      ...current,
+      segments: resolveRevisionConflict(current.segments, revisionId, choice),
+    }));
+  }
+
+  private markReviewed(): void {
+    const selected = this.selected;
+    if (!selected || selected.state !== 'confirmed') return;
+    this.commit('该段已复查，无需修改', (current) => ({
+      ...current,
+      segments: markSegmentReviewed(current.segments, selected.id),
+    }));
+  }
+
+  private primaryActionForSelected(): void {
+    const selected = this.selected;
+    if (!selected) {
+      this.confirmSelected();
+      return;
+    }
+    if (selected.state !== 'confirmed') {
+      this.confirmSelected();
+      return;
+    }
+    const revision = activeRevision(selected);
+    if (revision?.status === 'pending') this.approveRevision(revision.id);
+    else if (!revision) this.submitRevision();
+    // 冲突状态下 ⌘/Ctrl+Enter 不自动裁决，必须在并排差异中明确选择。
+  }
+
   private setConnection(connection: ConnectionState): void {
     this.commit(connection === 'offline' ? '切换到离线校正' : connection === 'degraded' ? '模拟延迟波动' : '连接已恢复', (current) => ({
       ...current,
@@ -492,7 +691,11 @@ export class CaptionDesk extends LitElement {
     this.model = merged;
     this.persist();
     const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
+    const conflictCount = this.stats.revisionConflict;
     this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    if (conflictCount > 0) {
+      this.pushToast('error', `${conflictCount} 段离线回修与已复查版本冲突`, '已并排显示差异，请校对员选择保留版本，晚到版本不会直接覆盖');
+    }
   }
 
   private addRuleFromSelection(): void {
@@ -574,7 +777,7 @@ export class CaptionDesk extends LitElement {
     }
     if (modifier && event.key === 'Enter') {
       event.preventDefault();
-      this.confirmSelected();
+      this.primaryActionForSelected();
       return;
     }
     if (event.altKey && event.key.toLocaleLowerCase() === 'j') {
@@ -602,10 +805,12 @@ export class CaptionDesk extends LitElement {
     return html`
       <div class="segment-list">
         ${segments.map((item) => html`
-          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state}" @click=${() => this.selectSegment(item.id)}>
+          <button class="segment-card ${item.id === this.model.selectedId ? 'selected' : ''} ${item.state} ${item.state === 'confirmed' ? this.reviewCardClass(item) : ''}" @click=${() => this.selectSegment(item.id)}>
             <div class="segment-meta">
               <span>${formatClock(item.startTime)} · #${String(item.sequence).padStart(3, '0')}</span>
-              <span class="segment-state ${item.state}">${stateLabel(item.state)}</span>
+              ${item.state === 'confirmed'
+                ? html`<span class="review-badge ${activeRevision(item)?.status === 'conflict' ? 'conflict' : item.reviewState}">${activeRevision(item)?.status === 'conflict' ? '版本冲突' : reviewStateLabel(item.reviewState)}</span>`
+                : html`<span class="segment-state ${item.state}">${stateLabel(item.state)}</span>`}
             </div>
             <p class="segment-text">${item.original}</p>
             ${item.corrected !== item.original ? html`<p class="segment-corrected">${item.corrected}</p>` : nothing}
@@ -614,6 +819,7 @@ export class CaptionDesk extends LitElement {
               <span>·</span>
               <span>${formatAge(item.receivedAt)}</span>
               ${item.revision > 0 ? html`<span>· <b>修改 ${item.revision} 次</b></span>` : nothing}
+              ${item.reviewHistory.length ? html`<span>· <b>回修 ${item.reviewHistory.length} 次</b></span>` : nothing}
             </div>
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
@@ -626,8 +832,9 @@ export class CaptionDesk extends LitElement {
   private renderEditor() {
     const item = this.selected;
     if (!item) {
-      return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
+      return html`<div class="empty"><strong>选择一条字幕</strong><p>待确认片段在这里校对；已送直播的片段可发起播出回修。可使用 Alt+J / Alt+K 切换。</p></div>`;
     }
+    if (item.state === 'confirmed') return this.renderRevisionEditor(item);
     const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
     return html`
       <div class="editor-scroll">
@@ -693,6 +900,154 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
+  private renderDiffParts(current: string, incoming: string) {
+    return html`<div class="diff-line">${diffText(current, incoming).map((part) => part.type === 'same'
+      ? part.value
+      : html`<span class=${part.type === 'add' ? 'diff-add' : 'diff-remove'}>${part.value}</span>`)}</div>`;
+  }
+
+  private renderRevisionEditor(item: CaptionSegment) {
+    const revision = activeRevision(item);
+    const isConflict = revision?.status === 'conflict';
+    const reviewClass = isConflict ? 'review-conflict' : item.reviewState === 'reviewed' ? 'review-done' : item.reviewState === 'pending' ? 'review-pending' : '';
+    const banner = isConflict
+      ? html`<strong>版本冲突待裁决</strong><span>离线期间的晚到回修与已复查版本不一致，系统未做覆盖。请在下方并排对比后选择保留版本。</span>`
+      : revision
+        ? html`<strong>待复核 · 原字幕继续播出</strong><span>回修提交于 ${formatAge(revision.createdAt)}，复核完成前直播区仍显示原内容，并带“待复核”标记。</span>`
+        : item.reviewState === 'reviewed'
+          ? html`<strong>该段已复查</strong><span>${item.reviewedAt ? `复查于 ${formatAge(item.reviewedAt)}。` : ''}如播出中又发现错字，可再次发起回修。</span>`
+          : html`<strong>该段尚未复查</strong><span>发现播出错字可直接回修；确认无误可标记为“已复查”。复核前原字幕不会被替换。</span>`;
+
+    return html`
+      <div class="revision-scroll">
+        <div class="revision-card">
+          <div class="revision-card-head">
+            <div>
+              <div class="editor-time">${formatClock(item.startTime)} — ${formatClock(item.startTime + 7)}</div>
+              <p class="editor-title">直播片段 #${String(item.sequence).padStart(3, '0')} · ${item.confirmedAt ? `确认于 ${formatAge(item.confirmedAt)}` : ''}</p>
+            </div>
+            <div class="review-badges">
+              <span class="review-badge ${isConflict ? 'conflict' : item.reviewState}">${isConflict ? '版本冲突待裁决' : reviewStateLabel(item.reviewState)}</span>
+              ${item.reviewHistory.length ? html`<span class="review-badge unreviewed">回修 ${item.reviewHistory.length} 次</span>` : nothing}
+            </div>
+          </div>
+          <div class="revision-card-body">
+            <div class="revision-banner ${revision ? (isConflict ? 'review-conflict' : 'review-pending') : reviewClass}">${banner}</div>
+
+            <div class="live-box ${revision ? 'live-pending' : ''}">
+              <h4>${revision ? '当前送播内容（复核前保持可见）' : '当前送播内容'}</h4>
+              <p>[${item.speaker}] ${item.corrected}</p>
+              <footer>来源：${item.source === 'offline' ? '离线恢复合并' : '直播确认'}${item.source === 'offline' && item.staleReason ? ` · ${item.staleReason}` : ''}</footer>
+            </div>
+
+            ${isConflict && revision ? html`
+              <cds-inline-notification kind="error" low-contrast title="离线回修与已复查版本冲突" subtitle="晚到版本不能直接覆盖已复查内容，请选择最终播出版本。"></cds-inline-notification>
+              <div class="conflict-grid">
+                <div class="conflict-cell current">
+                  <h4>当前已复查版本</h4>
+                  <p>[${item.speaker}] ${item.corrected}</p>
+                  ${this.renderDiffParts(item.corrected, revision.nextText)}
+                  <small><span class="diff-remove">删除线</span> 是晚到回修要删掉的字，<span class="diff-add">绿色</span> 是晚到回修要补的字。</small>
+                  <cds-button kind="secondary" size="sm" @click=${() => this.chooseConflictVersion(revision.id, 'current')}>保留已复查版本</cds-button>
+                </div>
+                <div class="conflict-cell incoming">
+                  <h4>离线晚到回修版本</h4>
+                  <p>[${revision.nextSpeaker}] ${revision.nextText}</p>
+                  ${this.renderDiffParts(revision.nextText, item.corrected)}
+                  <small><span class="diff-remove">删除线</span> 是已复查版本中没有的字，<span class="diff-add">绿色</span> 是已复查版本多出的字。</small>
+                  <small>回修原因：${revision.reason} · 提交于 ${formatAge(revision.createdAt)}（离线）</small>
+                  <cds-button kind="primary" size="sm" @click=${() => this.chooseConflictVersion(revision.id, 'incoming')}>采用晚到回修</cds-button>
+                </div>
+              </div>
+            ` : nothing}
+
+            ${revision && !isConflict ? html`
+              <div class="propose-box ${revision.createdOffline ? 'offline' : ''}">
+                <h4>${revision.createdOffline ? '离线暂存的回修版本' : '待复核的回修版本'}</h4>
+                <p>[${revision.nextSpeaker}] ${revision.nextText}</p>
+                <footer>回修原因：${revision.reason}<br/>提交于 ${formatStamp(revision.createdAt)}${revision.createdOffline ? ' · 离线发件箱' : ''}</footer>
+              </div>
+              <div class="revision-actions">
+                <cds-button kind="danger--tertiary" size="sm" @click=${() => this.rejectRevision(revision.id)}>驳回，保留原字幕</cds-button>
+                <cds-button kind="primary" size="sm" @click=${() => this.approveRevision(revision.id)}>复核通过并更新直播</cds-button>
+              </div>
+            ` : nothing}
+
+            ${!revision ? html`
+              <div class="revision-form-grid">
+                <cds-select label-text="回修后发言人" value=${this.revisionSpeaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => { this.revisionSpeaker = event.detail.value; }}>
+                  ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
+                </cds-select>
+                <div></div>
+              </div>
+              <cds-textarea
+                class="caption-input"
+                label-text="回修后的字幕文本"
+                helper-text="在送播内容基础上修改；原字幕在复核通过前继续播出"
+                .value=${this.revisionText}
+                @input=${(event: Event) => { this.revisionText = (event.currentTarget as any).value; }}
+              ></cds-textarea>
+              <cds-text-input
+                label-text="回修原因（必填）"
+                placeholder="例如：观众反馈错字 / 专有名词写法更正 / 数字单位错误"
+                .value=${this.revisionReason}
+                @input=${(event: Event) => { this.revisionReason = (event.currentTarget as any).value; }}
+              ></cds-text-input>
+              <div class="revision-actions">
+                <cds-button kind="ghost" size="sm" @click=${this.markReviewed}>无需修改，标记已复查</cds-button>
+                <cds-button kind="primary" size="sm" @click=${this.submitRevision}>${this.model.connection === 'offline' ? '提交并暂存离线发件箱' : '提交回修（原字幕继续播出）'}</cds-button>
+              </div>
+            ` : nothing}
+          </div>
+        </div>
+
+        ${this.renderRevisionHistory(item)}
+      </div>
+    `;
+  }
+
+  private renderRevisionHistory(item: CaptionSegment) {
+    const history = item.reviewHistory;
+    if (!history.length) return nothing;
+    return html`
+      <div class="revision-card">
+        <div class="inspector-section-head" style="border-bottom:1px solid var(--cds-border-subtle,#e0e0e0);">
+          <h3 style="margin:0;font-size:12px;">回修历史（${history.length}）</h3>
+          <span>所有版本均可回看，选择结果长期保留</span>
+        </div>
+        <div class="revision-card-body">
+          <div class="revision-history">
+            ${history.map((rev) => {
+              const open = this.expandedRevisionId === rev.id;
+              return html`
+                <div class="history-item">
+                  <button class="history-head" @click=${() => { this.expandedRevisionId = open ? '' : rev.id; }}>
+                    <span>第 ${rev.revisionNo} 次回修 · ${revisionStatusLabel(rev.status)}${rev.createdOffline ? ' · 离线' : ''}</span>
+                    <time>${formatStamp(rev.createdAt)}</time>
+                  </button>
+                  ${open ? html`
+                    <div class="history-body">
+                      <div class="reason">原因：${rev.reason}</div>
+                      <div class="old">上一版（送播中）：[${rev.previousSpeaker}] ${rev.previousText}</div>
+                      <div class="next">回修版本：[${rev.nextSpeaker}] ${rev.nextText}</div>
+                      ${rev.status !== 'pending' && rev.status !== 'conflict' ? html`
+                        <div class="resolve">
+                          ${rev.status === 'approved' ? '复核通过' : '复核驳回'} · ${rev.resolvedAt ? formatStamp(rev.resolvedAt) : ''}
+                          ${rev.resolvedChoice ? ` · 选择：${rev.resolvedChoice === 'incoming' ? '采用回修版本' : '保留原版本'}` : ''}
+                          ${rev.resolveNote ? html`<br/>${rev.resolveNote}` : ''}
+                        </div>
+                      ` : html`<div class="resolve">${rev.status === 'conflict' ? '等待校对员并排裁决' : '等待复核'}</div>`}
+                    </div>
+                  ` : nothing}
+                </div>
+              `;
+            })}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   private renderInspector() {
     const item = this.selected;
     const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
@@ -732,18 +1087,28 @@ export class CaptionDesk extends LitElement {
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
+            <span>${confirmed.length} 段 · 待复核 ${this.stats.reviewPending}${this.stats.revisionConflict ? ` · 冲突 ${this.stats.revisionConflict}` : ''}</span>
           </div>
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
+            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => {
+              const revision = activeRevision(segment);
+              const isConflict = revision?.status === 'conflict';
+              const rowClass = isConflict ? 'review-conflict' : segment.reviewState === 'pending' ? 'review-pending' : segment.reviewState === 'reviewed' ? 'review-done' : '';
+              return html`
+              <button type="button" class="live-item ${rowClass} ${segment.id === this.model.selectedId ? 'selected' : ''}" @click=${() => this.selectSegment(segment.id)}>
+                <span class="live-item-row">
+                  <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
+                  <span class="review-badge ${isConflict ? 'conflict' : segment.reviewState}">${isConflict ? '版本冲突' : reviewStateLabel(segment.reviewState)}</span>
+                </span>
                 <p>${segment.corrected}</p>
+                ${revision ? html`<small>${isConflict ? '离线晚到回修与已复查版本冲突，点击并排裁决' : `回修待复核，原字幕继续播出 · 原因：${revision.reason}`}</small>` : nothing}
                 ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
-              </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+                ${!revision && segment.reviewHistory.length ? html`<small>已完成 ${segment.reviewHistory.length} 次回修 · 点击回看历史版本</small>` : nothing}
+              </button>`;
+            }) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.stats.reviewPending > 0 ? html`<div class="revision-banner ${this.stats.revisionConflict ? 'review-conflict' : 'review-pending'}"><strong>${this.stats.revisionConflict ? `${this.stats.revisionConflict} 段版本冲突待裁决` : `${this.stats.reviewPending} 段待复核`}</strong><span>${this.stats.revisionConflict ? '晚到离线回修不会覆盖已复查版本，需校对员并排选择。' : '复核完成前原字幕继续可见，点击直播区片段可直接复核。'}</span></div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -754,8 +1119,11 @@ export class CaptionDesk extends LitElement {
           <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
-              <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
-              <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
+              <div style="margin-top: 8px;"><strong>${item.state === 'confirmed' ? '当前送播：' : '修改前校正：'}</strong>${item.corrected}</div>
+              ${item.state === 'confirmed' ? html`
+                <div style="margin-top: 8px;"><strong>复查状态：</strong>${reviewStateLabel(item.reviewState)}${activeRevision(item) ? `（${revisionStatusLabel(activeRevision(item)!.status)}）` : ''}</div>
+                <div style="margin-top: 4px;">已提交 ${item.reviewHistory.length} 次播出回修${item.reviewedAt ? ` · 最近复查 ${formatAge(item.reviewedAt)}` : ''}</div>
+              ` : html`<div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>`}
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
         </section>
@@ -793,13 +1161,20 @@ export class CaptionDesk extends LitElement {
 
         <section class="status-strip">
           <div class="status-cell hero">
-            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <strong>${this.model.connection === 'offline'
+              ? '离线校正中，确认与回修暂存发件箱'
+              : stats.revisionConflict > 0
+                ? '离线回修与已复查版本冲突，等待并排裁决'
+                : stats.reviewPending > 0
+                  ? `${stats.reviewPending} 段回修待复核，原字幕继续播出`
+                  : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
+            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline} · 待复核 ${stats.reviewPending} · 冲突 ${stats.revisionConflict}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
           <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
-          <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
+          <div class="status-cell ${stats.stale + stats.duplicate + stats.revisionConflict > 0 ? 'danger' : ''}"><strong>${stats.stale + stats.duplicate + stats.revisionConflict}</strong><span>${stats.revisionConflict > 0 ? '异常/版本冲突' : '需要明确处理'}</span></div>
+          <div class="status-cell ${stats.reviewPending > 0 ? 'warning' : ''}"><strong>${stats.reviewPending}</strong><span>回修待复核</span></div>
           <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
             <label>字幕字号</label>
@@ -829,7 +1204,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>校对编辑台</h2>
-                <p>标点、专有名词、发言人和数字均可在确认前修改</p>
+                <p>确认前修改待校片段；选中直播片段可发起播出回修并复核</p>
               </div>
               <cds-tag type="green" size="sm">本地草稿</cds-tag>
             </div>
@@ -840,7 +1215,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <p>回修复核前原字幕继续可见；离线版本冲突时并排裁决</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
